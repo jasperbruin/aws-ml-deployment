@@ -1,0 +1,160 @@
+# Reusable Docker Build and Push workflow
+# Purpose:
+#   Build and optionally push container images for this repository using
+#   docker/build-push-action. Supports multi-arch builds, SBOM, provenance,
+#   GitHub Actions cache, and attestation.
+#
+# Inputs:
+#   dockerfile_path  - Path to the Dockerfile (default: "Dockerfile")
+#   build_context    - Docker build context (default: ".")
+#   registry         - Container registry URL (default: "ghcr.io")
+#   platforms        - Target platforms, comma-separated (default: "linux/amd64,linux/arm64")
+#   push_enabled     - Enable pushing to registry (default: true)
+#   custom_tags      - Additional image tags, comma-separated
+#
+# Outputs:
+#   image_tags   - Generated image tags
+#   image_digest - Digest of the built image
+#
+# Required secrets / permissions:
+#   - GITHUB_TOKEN (used for registry login and package write)
+#   - Workflow permissions: id-token: write for attestation/OIDC if used
+#
+#
+# Example call from another workflow:
+#   uses: ./.github/workflows/docker-build.yml
+#   with:
+#     dockerfile_path: ./Dockerfile
+#     build_context: .
+#     registry: ghcr.io
+#
+
+name: Reusable Docker Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile_path:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      build_context:
+        description: 'Docker build context path'
+        required: false
+        type: string
+        default: '.'
+      registry:
+        description: 'Container registry URL'
+        required: false
+        type: string
+        default: 'ghcr.io'
+      platforms:
+        description: 'Target platforms (comma-separated)'
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
+      push_enabled:
+        description: 'Enable pushing to registry'
+        required: false
+        type: boolean
+        default: true
+      custom_tags:
+        description: 'Additional custom tags (comma-separated)'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      image_tags:
+        description: 'Generated image tags'
+        value: ${{ jobs.build-and-push.outputs.tags }}
+      image_digest:
+        description: 'Image digest'
+        value: ${{ jobs.build-and-push.outputs.digest }}
+
+jobs:
+  check-dockerfile:
+    runs-on: ubuntu-latest
+    outputs:
+      dockerfile_exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if Dockerfile exists
+        id: check
+        run: |
+          if [ -f "${{ inputs.dockerfile_path }}" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Dockerfile found at ${{ inputs.dockerfile_path }}"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⏭️  No Dockerfile found at ${{ inputs.dockerfile_path }}, skipping build"
+          fi
+
+  build-and-push:
+    needs: check-dockerfile
+    if: needs.check-dockerfile.outputs.dockerfile_exists == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.registry }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            ${{ inputs.custom_tags }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile_path }}
+          push: ${{ inputs.push_enabled && github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: ${{ inputs.platforms }}
+          provenance: true
+          sbom: true
+
+      - name: Generate artifact attestation
+        if: inputs.push_enabled && github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ inputs.registry }}/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
