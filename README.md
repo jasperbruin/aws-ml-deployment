@@ -1,4 +1,4 @@
-# AutoDevOps Pipeline
+# From Docker to AWS Pipeline
 
 **Automated CI/CD pipeline for containerized applications with semantic versioning, Docker builds, and AWS ECS deployment.**
 
