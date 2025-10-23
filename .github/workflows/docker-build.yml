@@ -11,6 +11,7 @@
 #   platforms        - Target platforms, comma-separated (default: "linux/amd64,linux/arm64")
 #   push_enabled     - Enable pushing to registry (default: true)
 #   custom_tags      - Additional image tags, comma-separated
+#   semantic_version - Semantic version from release job (e.g., 1.2.3)
 #
 # Outputs:
 #   image_tags   - Generated image tags
@@ -20,14 +21,13 @@
 #   - GITHUB_TOKEN (used for registry login and package write)
 #   - Workflow permissions: id-token: write for attestation/OIDC if used
 #
-#
 # Example call from another workflow:
-#   uses: ./.github/workflows/docker-build.yml
+#   uses: ./.github/workflows/docker-build-reusable.yml
 #   with:
 #     dockerfile_path: ./Dockerfile
 #     build_context: .
 #     registry: ghcr.io
-#
+#     semantic_version: 1.2.3
 
 name: Reusable Docker Build and Push
 
@@ -61,6 +61,11 @@ on:
         default: true
       custom_tags:
         description: 'Additional custom tags (comma-separated)'
+        required: false
+        type: string
+        default: ''
+      semantic_version:
+        description: 'Semantic version from release job (e.g., 1.2.3)'
         required: false
         type: string
         default: ''
@@ -130,8 +135,9 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.semantic_version }},enable=${{ inputs.semantic_version != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.semantic_version }},enable=${{ inputs.semantic_version != '' }}
+            type=semver,pattern={{major}},value=${{ inputs.semantic_version }},enable=${{ inputs.semantic_version != '' }}
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
             ${{ inputs.custom_tags }}
