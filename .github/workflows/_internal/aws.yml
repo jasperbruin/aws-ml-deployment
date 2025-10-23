@@ -1,0 +1,115 @@
+name: Internal - AWS ECS Deploy
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      ecr_repository:
+        required: true
+        type: string
+      ecs_cluster:
+        required: true
+        type: string
+      ecs_service:
+        required: true
+        type: string
+      ecs_task_definition:
+        required: true
+        type: string
+      container_name:
+        required: true
+        type: string
+      ghcr_image_tag:
+        required: false
+        type: string
+        default: 'latest'
+      aws_role_arn:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+    outputs:
+      deployed_image:
+        value: ${{ jobs.deploy.outputs.image_uri }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    outputs:
+      image_uri: ${{ steps.push-ecr.outputs.image }}
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        if: inputs.aws_role_arn != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: GitHubActions-ECS
+
+      - name: Configure AWS (Keys)
+        if: inputs.aws_role_arn == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push to ECR
+        id: push-ecr
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          GHCR_IMAGE: ghcr.io/${{ github.repository }}:${{ inputs.ghcr_image_tag }}
+        run: |
+          echo "Pulling: $GHCR_IMAGE"
+          docker pull $GHCR_IMAGE
+          
+          ECR_IMAGE=$ECR_REGISTRY/${{ inputs.ecr_repository }}:${{ inputs.ghcr_image_tag }}
+          docker tag $GHCR_IMAGE $ECR_IMAGE
+          
+          ECR_LATEST=$ECR_REGISTRY/${{ inputs.ecr_repository }}:latest
+          docker tag $GHCR_IMAGE $ECR_LATEST
+          
+          docker push $ECR_IMAGE
+          docker push $ECR_LATEST
+          
+          echo "image=$ECR_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Update task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ inputs.ecs_task_definition }}
+          container-name: ${{ inputs.container_name }}
+          image: ${{ steps.push-ecr.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ inputs.ecs_service }}
+          cluster: ${{ inputs.ecs_cluster }}
+          wait-for-service-stability: true

@@ -1,0 +1,144 @@
+name: AutoDevOps Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      # Deployment target
+      deploy_to_aws:
+        description: 'Enable AWS ECS deployment'
+        required: false
+        type: boolean
+        default: false
+      
+      # Docker settings
+      dockerfile_path:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      platforms:
+        description: 'Docker platforms (comma-separated)'
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
+      
+      # AWS settings (only needed if deploy_to_aws is true)
+      aws_region:
+        description: 'AWS region'
+        required: false
+        type: string
+        default: ''
+      ecr_repository:
+        description: 'ECR repository name'
+        required: false
+        type: string
+        default: ''
+      ecs_cluster:
+        description: 'ECS cluster name'
+        required: false
+        type: string
+        default: ''
+      ecs_service:
+        description: 'ECS service name'
+        required: false
+        type: string
+        default: ''
+      ecs_task_definition:
+        description: 'Path to ECS task definition'
+        required: false
+        type: string
+        default: '.aws/task-definition.json'
+      container_name:
+        description: 'Container name in task definition'
+        required: false
+        type: string
+        default: ''
+      aws_role_arn:
+        description: 'AWS IAM role ARN for OIDC'
+        required: false
+        type: string
+        default: ''
+    
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+    
+    outputs:
+      version:
+        description: 'Released version'
+        value: ${{ jobs.semantic-release.outputs.new_release_version }}
+      image_tags:
+        description: 'Docker image tags'
+        value: ${{ jobs.docker-build.outputs.image_tags }}
+      deployed:
+        description: 'Whether deployment was successful'
+        value: ${{ jobs.deploy-to-aws.result == 'success' }}
+
+jobs:
+  # Step 1: Semantic Release
+  semantic-release:
+    uses: jasperbruin/aws-ml-deployment/.github/workflows/_internal/semantic-release.yml@main
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+  # Step 2: Build Docker image
+  docker-build:
+    needs: [semantic-release]
+    if: always() && !cancelled() && !failure()
+    uses: jasperbruin/aws-ml-deployment/.github/workflows/_internal/docker-build.yml@main
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      dockerfile_path: ${{ inputs.dockerfile_path }}
+      platforms: ${{ inputs.platforms }}
+      semantic_version: ${{ needs.semantic-release.outputs.new_release_version }}
+
+  # Step 3: Deploy to AWS ECS (optional)
+  deploy-to-aws:
+    needs: [semantic-release, docker-build]
+    if: inputs.deploy_to_aws && success()
+    uses: jasperbruin/aws-ml-deployment/.github/workflows/_internal/aws-ecs-deploy.yml@main
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    with:
+      aws_region: ${{ inputs.aws_region }}
+      ecr_repository: ${{ inputs.ecr_repository }}
+      ecs_cluster: ${{ inputs.ecs_cluster }}
+      ecs_service: ${{ inputs.ecs_service }}
+      ecs_task_definition: ${{ inputs.ecs_task_definition }}
+      container_name: ${{ inputs.container_name }}
+      ghcr_image_tag: ${{ needs.semantic-release.outputs.new_release_version || 'latest' }}
+      aws_role_arn: ${{ inputs.aws_role_arn }}
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  # Step 4: Summary
+  summary:
+    needs: [semantic-release, docker-build, deploy-to-aws]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "# 🚀 AutoDevOps Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.semantic-release.outputs.new_release_version || 'No release' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Docker Build**: ${{ needs.docker-build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **AWS Deployment**: ${{ needs.deploy-to-aws.result || 'Skipped' }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.semantic-release.outputs.new_release_published }}" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 🎉 New Release" >> $GITHUB_STEP_SUMMARY
+            echo "Version **${{ needs.semantic-release.outputs.new_release_version }}** has been released!" >> $GITHUB_STEP_SUMMARY
+          fi
