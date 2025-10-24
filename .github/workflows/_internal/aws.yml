@@ -1,12 +1,9 @@
-name: Internal - AWS ECS Deploy
+name: Internal - AWS ECS Deploy (GHCR)
 
 on:
   workflow_call:
     inputs:
       aws_region:
-        required: true
-        type: string
-      ecr_repository:
         required: true
         type: string
       ecs_cluster:
@@ -15,16 +12,16 @@ on:
       ecs_service:
         required: true
         type: string
-      ecs_task_definition:
+      task_definition_family:
         required: true
         type: string
       container_name:
         required: true
         type: string
-      ghcr_image_tag:
-        required: false
+      ghcr_image:
+        description: 'Full GHCR image URI (e.g., ghcr.io/owner/repo:1.2.3)'
+        required: true
         type: string
-        default: 'latest'
       aws_role_arn:
         required: false
         type: string
@@ -34,9 +31,6 @@ on:
         required: false
       AWS_SECRET_ACCESS_KEY:
         required: false
-    outputs:
-      deployed_image:
-        value: ${{ jobs.deploy.outputs.image_uri }}
 
 jobs:
   deploy:
@@ -44,20 +38,14 @@ jobs:
     permissions:
       contents: read
       id-token: write
-      packages: read
-    outputs:
-      image_uri: ${{ steps.push-ecr.outputs.image }}
-    
-    steps:
-      - uses: actions/checkout@v4
 
+    steps:
       - name: Configure AWS (OIDC)
         if: inputs.aws_role_arn != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ inputs.aws_role_arn }}
           aws-region: ${{ inputs.aws_region }}
-          role-session-name: GitHubActions-ECS
 
       - name: Configure AWS (Keys)
         if: inputs.aws_role_arn == ''
@@ -67,49 +55,58 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ inputs.aws_region }}
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Push to ECR
-        id: push-ecr
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          GHCR_IMAGE: ghcr.io/${{ github.repository }}:${{ inputs.ghcr_image_tag }}
+      - name: Get current task definition
+        id: get-task-def
         run: |
-          echo "Pulling: $GHCR_IMAGE"
-          docker pull $GHCR_IMAGE
-          
-          ECR_IMAGE=$ECR_REGISTRY/${{ inputs.ecr_repository }}:${{ inputs.ghcr_image_tag }}
-          docker tag $GHCR_IMAGE $ECR_IMAGE
-          
-          ECR_LATEST=$ECR_REGISTRY/${{ inputs.ecr_repository }}:latest
-          docker tag $GHCR_IMAGE $ECR_LATEST
-          
-          docker push $ECR_IMAGE
-          docker push $ECR_LATEST
-          
-          echo "image=$ECR_IMAGE" >> $GITHUB_OUTPUT
+          aws ecs describe-task-definition \
+            --task-definition ${{ inputs.task_definition_family }} \
+            --query 'taskDefinition' > task-def.json
 
-      - name: Update task definition
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ${{ inputs.ecs_task_definition }}
-          container-name: ${{ inputs.container_name }}
-          image: ${{ steps.push-ecr.outputs.image }}
+      - name: Update task definition with new image
+        id: update-task-def
+        run: |
+          # Update the image in the task definition
+          jq --arg IMAGE "${{ inputs.ghcr_image }}" \
+             --arg CONTAINER "${{ inputs.container_name }}" \
+             '.containerDefinitions |= map(
+               if .name == $CONTAINER then .image = $IMAGE else . end
+             ) | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+             task-def.json > updated-task-def.json
+          
+          cat updated-task-def.json
 
-      - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ inputs.ecs_service }}
-          cluster: ${{ inputs.ecs_cluster }}
-          wait-for-service-stability: true
+      - name: Register new task definition
+        id: register
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://updated-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          echo "✅ Registered task definition: $TASK_DEF_ARN"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ inputs.ecs_cluster }} \
+            --service ${{ inputs.ecs_service }} \
+            --task-definition ${{ steps.register.outputs.task_def_arn }} \
+            --force-new-deployment
+
+      - name: Wait for service stability
+        run: |
+          echo "⏳ Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ inputs.ecs_cluster }} \
+            --services ${{ inputs.ecs_service }}
+          
+          echo "✅ Service deployment completed!"
+
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 ECS Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster**: ${{ inputs.ecs_cluster }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service**: ${{ inputs.ecs_service }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ inputs.ghcr_image }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Task Definition**: ${{ steps.register.outputs.task_def_arn }}" >> $GITHUB_STEP_SUMMARY
